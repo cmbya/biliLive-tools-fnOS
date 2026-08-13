@@ -1,0 +1,127 @@
+name: Build biliLive-tools fnOS FPK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "可选：手动指定 biliLive-tools 版本，例如 3.19.0；留空则使用上游最新正式版"
+        required: false
+        type: string
+  schedule:
+    # GitHub cron 使用 UTC。每天 00:37 UTC（北京时间 08:37）检查一次。
+    - cron: "37 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 获取目标版本
+        id: version
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MANUAL_VERSION:-}" ]; then
+            TAG="${MANUAL_VERSION#v}"
+          else
+            TAG="$(python3 - <<'PY'
+          import json, urllib.request
+          req = urllib.request.Request(
+              'https://api.github.com/repos/renmu123/biliLive-tools/releases/latest',
+              headers={'Accept':'application/vnd.github+json','User-Agent':'biliLive-tools-fnOS-builder'}
+          )
+          with urllib.request.urlopen(req, timeout=30) as r:
+              print(json.load(r)['tag_name'].lstrip('v'))
+          PY
+          )"
+          fi
+          VERSION="${TAG#v}"
+          PACK_REV="$(tr -d '[:space:]' < PACK_REV)"
+          RELEASE_TAG="fnos-${VERSION}-${PACK_REV}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "pack_rev=$PACK_REV" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "目标上游版本: $VERSION"
+          echo "飞牛封装版本: $PACK_REV"
+
+      - name: 检查是否已经发布
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "已经存在 $RELEASE_TAG，本次无需重复构建。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 验证上游 Release 与 npm CLI
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, urllib.request
+          version=os.environ['VERSION']
+          url=f'https://github.com/renmu123/biliLive-tools/archive/refs/tags/{version}.tar.gz'
+          req=urllib.request.Request(url, method='HEAD', headers={'User-Agent':'biliLive-tools-fnOS-builder'})
+          with urllib.request.urlopen(req, timeout=30) as r:
+              print('上游标签可用:', version, r.status)
+          PY
+          CLI_VERSION="$(npm view "bililive-cli@${VERSION}" version --json | tr -d '"[:space:]')"
+          test "$CLI_VERSION" = "$VERSION"
+          echo "npm bililive-cli 已发布: $CLI_VERSION"
+
+      - name: 构建 x86 FPK
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          chmod +x ./scripts/build_fpk.sh
+          ./scripts/build_fpk.sh "${{ steps.version.outputs.version }}"
+
+      - name: 上传 Actions 构建产物
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: biliLive-tools-${{ steps.version.outputs.version }}-${{ steps.version.outputs.pack_rev }}-fnOS-x86
+          path: |
+            dist/*.fpk
+            dist/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: 创建 GitHub Pre-release
+        if: steps.existing.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          PACK_REV: ${{ steps.version.outputs.pack_rev }}
+        run: |
+          cat > /tmp/release-notes.md <<EOF2
+          自动检测到上游 biliLive-tools **${VERSION}**，并生成 fnOS x86 原生 FPK。
+
+          - 上游版本：${VERSION}
+          - fnOS 封装：${PACK_REV}
+          - 架构：x86 / amd64
+          - Docker：不使用
+          - 升级：保留应用配置、账号/任务数据和录像目录
+          - WebUI：使用 fnOS 同源代理访问本机后端
+
+          **这是自动构建的 Pre-release。上游升级可能改变依赖或接口，建议先在飞牛上覆盖升级测试，确认页面和录制正常后再改成正式版。**
+          EOF2
+
+          gh release create "$RELEASE_TAG" \
+            dist/*.fpk dist/SHA256SUMS.txt \
+            --title "biliLive-tools ${VERSION} fnOS x86 (${PACK_REV})" \
+            --notes-file /tmp/release-notes.md \
+            --prerelease
