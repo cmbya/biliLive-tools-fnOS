@@ -1,0 +1,126 @@
+#!/bin/bash
+set -u
+RUNTIME="${TRIM_PKGVAR}/native-runtime"
+FRONT_PID="${TRIM_PKGVAR}/bililivetools.front.pid"
+BACK_PID="${TRIM_PKGVAR}/bililivetools.back.pid"
+FRONT_LOG="${TRIM_PKGVAR}/webui.log"
+BACK_LOG="${TRIM_PKGVAR}/backend.log"
+FRONT_PORT="${TRIM_SERVICE_PORT:-3000}"
+BACK_PORT="18010"
+VIDEO_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
+
+export PATH="$RUNTIME/bin:/var/apps/nodejs_v22/target/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export NODE_ENV=production
+export TZ=Asia/Shanghai
+export HOME="$RUNTIME/home"
+export BAIDUPCS_GO_CONFIG_DIR="$RUNTIME/data"
+export ALIYUNPAN_CONFIG_DIR="$RUNTIME/data"
+export BILILIVE_TOOLS_DELETE_DIRS="$VIDEO_DIR"
+
+pid_alive() {
+  local f="$1" p=""
+  [ -f "$f" ] || return 1
+  p="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+clean_pid() { pid_alive "$1" || rm -f "$1"; }
+
+is_running() {
+  clean_pid "$BACK_PID"; clean_pid "$FRONT_PID"
+  pid_alive "$BACK_PID" && pid_alive "$FRONT_PID"
+}
+
+repair_video_link() {
+  [ -n "$VIDEO_DIR" ] || return 1
+  mkdir -p "$VIDEO_DIR" "$RUNTIME"
+  if [ -L "$RUNTIME/video" ]; then
+    local cur; cur="$(readlink "$RUNTIME/video" 2>/dev/null || true)"
+    if [ "$cur" != "$VIDEO_DIR" ]; then rm -f "$RUNTIME/video"; ln -s "$VIDEO_DIR" "$RUNTIME/video"; fi
+  elif [ ! -e "$RUNTIME/video" ]; then
+    ln -s "$VIDEO_DIR" "$RUNTIME/video"
+  fi
+}
+
+stop_one() {
+  local f="$1" p="" n=0
+  if pid_alive "$f"; then
+    p="$(head -n1 "$f" | tr -d '[:space:]')"
+    kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 15 ]; do sleep 1; n=$((n+1)); done
+    if kill -0 "$p" 2>/dev/null; then kill -KILL -- "-$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null || true; fi
+  fi
+  rm -f "$f"
+}
+
+start_app() {
+  if is_running; then return 0; fi
+  stop_one "$FRONT_PID"; stop_one "$BACK_PID"
+  repair_video_link || { echo "默认录像共享目录不可用。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+
+  [ -x /var/apps/nodejs_v22/target/bin/node ] || { echo "飞牛 Node.js 22 运行时不可用。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+  [ -f "$RUNTIME/backend/ENTRY" ] || { echo "biliLive-tools 后端运行环境缺失，请重新安装/升级。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+  [ -f "$RUNTIME/webui/index.html" ] || { echo "biliLive-tools WebUI 缺失，请重新安装/升级。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+  [ -s "${TRIM_PKGETC}/passkey" ] || { echo "Web 管理密码不存在，请进入应用设置重新设置。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+
+  export BILILIVE_TOOLS_PASSKEY="$(cat "${TRIM_PKGETC}/passkey")"
+  export BILILIVE_TOOLS_BILIKEY="$(cat "$RUNTIME/bilikey")"
+  ENTRY="$(cat "$RUNTIME/backend/ENTRY" 2>/dev/null | head -n1 | tr -d '\r\n')"
+  case "$ENTRY" in
+    /*) ;;
+    *) ENTRY="$RUNTIME/backend/$ENTRY" ;;
+  esac
+  if [ ! -f "$ENTRY" ]; then
+    ENTRY="$(find "$RUNTIME/backend/node_modules/bililive-cli" -type f -name index.cjs -path '*/lib/*' | head -n1 || true)"
+  fi
+  [ -n "$ENTRY" ] && [ -f "$ENTRY" ] || { echo "找不到 bililive-cli 启动文件。" > "${TRIM_TEMP_LOGFILE}"; return 1; }
+
+  mkdir -p "$RUNTIME/data" "$RUNTIME/home"
+  cd "$RUNTIME" || return 1
+  printf '%s starting backend\n' "$(date '+%F %T')" >> "$BACK_LOG"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid node "$ENTRY" server --config "$RUNTIME/config.json" >> "$BACK_LOG" 2>&1 &
+  else
+    node "$ENTRY" server --config "$RUNTIME/config.json" >> "$BACK_LOG" 2>&1 &
+  fi
+  echo $! > "$BACK_PID"
+
+  sleep 3
+  if ! pid_alive "$BACK_PID"; then
+    rm -f "$BACK_PID"
+    echo "biliLive-tools 后端启动失败，请查看 ${BACK_LOG}。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+
+  export FRONTEND_PORT="$FRONT_PORT"
+  export BACKEND_PORT="$BACK_PORT"
+  export BACKEND_HOST=127.0.0.1
+  export WEB_ROOT="$RUNTIME/webui"
+  printf '%s starting web wrapper\n' "$(date '+%F %T')" >> "$FRONT_LOG"
+  if command -v setsid >/dev/null 2>&1; then
+    setsid node "$RUNTIME/web_server.js" >> "$FRONT_LOG" 2>&1 &
+  else
+    node "$RUNTIME/web_server.js" >> "$FRONT_LOG" 2>&1 &
+  fi
+  echo $! > "$FRONT_PID"
+  sleep 2
+  if ! pid_alive "$FRONT_PID"; then
+    stop_one "$BACK_PID"
+    echo "biliLive-tools WebUI 启动失败，请查看 ${FRONT_LOG}。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+  return 0
+}
+
+stop_app() {
+  stop_one "$FRONT_PID"
+  stop_one "$BACK_PID"
+  return 0
+}
+
+case "${1:-}" in
+  start) start_app ;;
+  stop) stop_app ;;
+  status) if is_running; then exit 0; else exit 3; fi ;;
+  *) echo "Unknown command: ${1:-}" > "${TRIM_TEMP_LOGFILE}"; exit 1 ;;
+esac
