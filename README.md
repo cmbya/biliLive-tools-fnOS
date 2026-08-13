@@ -2,32 +2,15 @@
 
 这是 `renmu123/biliLive-tools` 的非官方 fnOS x86 原生自动构建仓库。
 
-- 不使用 Docker
 - 每天检查一次上游 GitHub 正式 Release
 - 发现新版本后自动生成 `.fpk`
 - 自动发布为 GitHub Pre-release
 - 可在 Actions 页面手动指定版本构建
 - `PACK_REV` 是 fnOS 封装版本，当前为 `native1`
 
-## 第一次设置
-
-1. 新建公开仓库 `biliLive-tools-fnOS`。
-2. 把本模板根目录中的文件上传到仓库根目录。
-3. `.github` 若网页上传时被隐藏，请用 **Add file → Create new file**，文件名输入：
-   `.github/workflows/build-bililive-fpk.yml`，再粘贴模板中的 workflow 内容。
-4. 仓库 **Settings → Actions → General → Workflow permissions** 选择 **Read and write permissions** 并保存。
-5. 进入 **Actions → Build biliLive-tools fnOS FPK → Run workflow**，第一次留空版本直接运行。
-6. 成功后在 **Releases** 下载 FPK。
-
 ## 自动检查时间
 
-Workflow 使用：
-
-```yaml
-- cron: "37 0 * * *"
-```
-
-GitHub cron 为 UTC，即每天北京时间约 08:37 检查一次。
+每天北京时间约 08:37 检查一次。
 
 ## 版本规则
 
