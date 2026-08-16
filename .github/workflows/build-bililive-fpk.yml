@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "可选：手动指定 biliLive-tools 版本，例如 3.19.0；留空则使用上游最新正式版"
+        description: "可选：手动指定 biliLive-tools 版本，例如 3.20.0；留空则使用上游最新正式版"
         required: false
         type: string
+
   schedule:
-    # GitHub cron 使用 UTC。每天 00:37 UTC（北京时间 08:37）检查一次。
     - cron: "37 0 * * *"
 
 permissions:
@@ -28,27 +28,76 @@ jobs:
           MANUAL_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
+
           if [ -n "${MANUAL_VERSION:-}" ]; then
             TAG="${MANUAL_VERSION#v}"
+            echo "手动指定版本: $TAG"
           else
-            TAG="$(python3 - <<'PY'
-          import json, urllib.request
-          req = urllib.request.Request(
-              'https://api.github.com/repos/renmu123/biliLive-tools/releases/latest',
-              headers={'Accept':'application/vnd.github+json','User-Agent':'biliLive-tools-fnOS-builder'}
-          )
-          with urllib.request.urlopen(req, timeout=30) as r:
-              print(json.load(r)['tag_name'].lstrip('v'))
-          PY
-          )"
+            echo "自动获取 biliLive-tools 最新正式 Release..."
+
+            set +e
+
+            LATEST_URL="$(
+              curl \
+                --fail \
+                --silent \
+                --show-error \
+                --location \
+                --retry 4 \
+                --retry-delay 3 \
+                --retry-all-errors \
+                --connect-timeout 15 \
+                --max-time 90 \
+                --output /dev/null \
+                --write-out '%{url_effective}' \
+                'https://github.com/renmu123/biliLive-tools/releases/latest'
+            )"
+
+            CURL_EXIT=$?
+
+            set -e
+
+            if [ "$CURL_EXIT" -eq 0 ] && \
+               [[ "$LATEST_URL" == */releases/tag/* ]]; then
+
+              TAG="${LATEST_URL##*/}"
+              TAG="${TAG#v}"
+
+              echo "✅ 最新 Release: $TAG"
+            else
+              echo "⚠️ Release 网页获取失败，改用 Git Tags"
+
+              TAG="$(
+                git ls-remote \
+                  --tags \
+                  --refs \
+                  https://github.com/renmu123/biliLive-tools.git \
+                | awk '{print $2}' \
+                | sed 's#refs/tags/##' \
+                | sed 's/^v//' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                | sort -V \
+                | tail -n 1
+              )"
+
+              if [ -z "$TAG" ]; then
+                echo "❌ 无法取得最新正式版本"
+                exit 1
+              fi
+
+              echo "✅ Git Tags 最新正式版本: $TAG"
+            fi
           fi
+
           VERSION="${TAG#v}"
           PACK_REV="$(tr -d '[:space:]' < PACK_REV)"
           RELEASE_TAG="fnos-${VERSION}-${PACK_REV}"
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "pack_rev=$PACK_REV" >> "$GITHUB_OUTPUT"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
           echo "目标上游版本: $VERSION"
           echo "飞牛封装版本: $PACK_REV"
 
@@ -65,29 +114,160 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 验证上游 Release 与 npm CLI
+      - name: 验证上游与 native2 时间补丁兼容
         if: steps.existing.outputs.exists != 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+
+          echo "验证上游 Tag: $VERSION"
+
+          if ! git ls-remote \
+            --exit-code \
+            --tags \
+            --refs \
+            https://github.com/renmu123/biliLive-tools.git \
+            "refs/tags/$VERSION" \
+            >/dev/null 2>&1; then
+
+            if ! git ls-remote \
+              --exit-code \
+              --tags \
+              --refs \
+              https://github.com/renmu123/biliLive-tools.git \
+              "refs/tags/v$VERSION" \
+              >/dev/null 2>&1; then
+
+              echo "❌ 上游不存在 Tag: $VERSION"
+              exit 1
+            fi
+          fi
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          cd "$TMP_DIR"
+
+          printf '%s\n' \
+            '{"name":"bililive-native2-check","private":true}' \
+            > package.json
+
+          export npm_config_force=true
+          export SKIP_NTSUSPEND_BINARY=1
+
+          npm install \
+            --force \
+            --omit=dev \
+            --no-audit \
+            --no-fund \
+            "bililive-cli@${VERSION}"
+
+          node \
+            node_modules/bililive-cli/lib/index.cjs \
+            --version \
+            || true
+
           python3 - <<'PY'
-          import os, urllib.request
-          version=os.environ['VERSION']
-          url=f'https://github.com/renmu123/biliLive-tools/archive/refs/tags/{version}.tar.gz'
-          req=urllib.request.Request(url, method='HEAD', headers={'User-Agent':'biliLive-tools-fnOS-builder'})
-          with urllib.request.urlopen(req, timeout=30) as r:
-              print('上游标签可用:', version, r.status)
+          from pathlib import Path
+          import re
+
+          files = list(
+              Path(".").rglob(
+                  "@bililive-tools/manager/lib/manager.js"
+              )
+          )
+
+          if not files:
+              raise SystemExit(
+                  "❌ 找不到 manager.js"
+              )
+
+          path = min(
+              files,
+              key=lambda p: len(str(p)),
+          )
+
+          text = path.read_text(
+              encoding="utf-8",
+          )
+
+          start_pattern = re.compile(
+              r"if\s*\(\s*!ignoreDataLimit\s*&&\s*"
+              r"isBetweenTimeRange\(\s*recorder\.handleTime\s*\)"
+              r"\s*\)\s*return\s*;?"
+          )
+
+          handle_pos = text.find(
+              "const handleBatchQuery"
+          )
+
+          need_pos = text.find(
+              "const needCheckRecorders"
+          )
+
+          batch_pattern = re.compile(
+              r'(\.filter\(\s*\(r\)\s*=>\s*'
+              r'r\.providerId\s*===\s*'
+              r'["\']Bilibili["\']\s*\))'
+          )
+
+          start_count = len(
+              list(
+                  start_pattern.finditer(text)
+              )
+          )
+
+          if (
+              handle_pos < 0
+              or need_pos <= handle_pos
+          ):
+              batch_count = 0
+          else:
+              batch_count = len(
+                  list(
+                      batch_pattern.finditer(
+                          text[
+                              handle_pos:
+                              need_pos
+                          ]
+                      )
+                  )
+              )
+
+          print(
+              "startRecord pattern:",
+              start_count,
+          )
+
+          print(
+              "Bilibili batch pattern:",
+              batch_count,
+          )
+
+          if start_count != 1:
+              raise SystemExit(
+                  "❌ 上游 startRecord 结构变化，"
+                  "native2 补丁需要更新"
+              )
+
+          if batch_count != 1:
+              raise SystemExit(
+                  "❌ 上游 Bilibili batch 结构变化，"
+                  "native2 补丁需要更新"
+              )
+
+          print(
+              "✅ native2 时间补丁兼容性检查通过"
+          )
           PY
-          CLI_VERSION="$(npm view "bililive-cli@${VERSION}" version --json | tr -d '"[:space:]')"
-          test "$CLI_VERSION" = "$VERSION"
-          echo "npm bililive-cli 已发布: $CLI_VERSION"
 
       - name: 构建 x86 FPK
         if: steps.existing.outputs.exists != 'true'
         run: |
           chmod +x ./scripts/build_fpk.sh
-          ./scripts/build_fpk.sh "${{ steps.version.outputs.version }}"
+          ./scripts/build_fpk.sh \
+            "${{ steps.version.outputs.version }}"
 
       - name: 上传 Actions 构建产物
         if: steps.existing.outputs.exists != 'true'
@@ -114,14 +294,18 @@ jobs:
           - fnOS 封装：${PACK_REV}
           - 架构：x86 / amd64
           - Docker：不使用
+          - native2：修复监控时间段提前录制
+          - Bilibili：修复批量查询绕过 handleTime
+          - startRecord：修复反向时间判断
+          - 日志：录像目录/biliLive-tools-Logs
           - 升级：保留应用配置、账号/任务数据和录像目录
-          - WebUI：使用 fnOS 同源代理访问本机后端
 
-          **这是自动构建的 Pre-release。上游升级可能改变依赖或接口，建议先在飞牛上覆盖升级测试，确认页面和录制正常后再改成正式版。**
+          **这是自动构建的 Pre-release。**
           EOF2
 
           gh release create "$RELEASE_TAG" \
-            dist/*.fpk dist/SHA256SUMS.txt \
+            dist/*.fpk \
+            dist/SHA256SUMS.txt \
             --title "biliLive-tools ${VERSION} fnOS x86 (${PACK_REV})" \
             --notes-file /tmp/release-notes.md \
             --prerelease
