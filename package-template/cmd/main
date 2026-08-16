@@ -104,7 +104,7 @@ path.write_text(
 )
 
 print(
-    "[fnOS native4 log] application logPath=" + log_path,
+    "[fnOS native5 log] application logPath=" + log_path,
     flush=True,
 )
 PY
@@ -120,23 +120,126 @@ import sys
 
 backend = Path(sys.argv[1]).resolve()
 
-candidates = list(backend.rglob("@bililive-tools/manager/lib/manager.js"))
-if not candidates:
-    candidates = [
-        p for p in backend.rglob("manager.js")
-        if "@bililive-tools" in str(p)
-        and "manager" in str(p)
-        and "/lib/" in str(p).replace("\\", "/")
-    ]
+# ============================================================
+# fnOS native5: bundle-aware target discovery
+#
+# npm 的 bililive-cli 发行包可能把 liveManager 打进一个大的
+# index-*.cjs，而不是保留 @bililive-tools/manager/lib/manager.js。
+# ============================================================
+search_roots = [
+    backend / "node_modules" / "bililive-cli" / "lib",
+    backend / "node_modules" / "@bililive-tools" / "manager" / "lib",
+]
 
-if not candidates:
+all_candidates = []
+
+for base in search_roots:
+    if not base.exists():
+        continue
+
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+
+        if p.suffix.lower() not in {".js", ".cjs", ".mjs"}:
+            continue
+
+        try:
+            sample = p.read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except OSError:
+            continue
+
+        score = 0
+
+        # Strongest indicators: native2 successfully patched this exact bundle.
+        if "// fnOS native2: monitor-time guard" in sample:
+            score += 1000
+
+        if "[fnOS native2 time] startRecord" in sample:
+            score += 800
+
+        # Retrying a partially patched package.
+        if "// fnOS native3: strict monitor-time helper" in sample:
+            score += 1200
+
+        if "// fnOS native4: monitor-window enter re-arm" in sample:
+            score += 1200
+
+        # Upstream manager structural signals.
+        if "checkLiveStatusAndRecord" in sample:
+            score += 120
+
+        if "ignoreDataLimit" in sample:
+            score += 120
+
+        if "isBetweenTimeRange" in sample:
+            score += 100
+
+        if "handleBatchQuery" in sample:
+            score += 80
+
+        if "disableAutoCheck" in sample:
+            score += 40
+
+        if "recordHandle" in sample:
+            score += 40
+
+        if score > 0:
+            all_candidates.append((score, p, sample))
+
+if not all_candidates:
+    searched = ", ".join(str(p) for p in search_roots)
     raise SystemExit(
-        "[fnOS native3 time] ERROR: "
-        "找不到 @bililive-tools/manager/lib/manager.js"
+        "[fnOS native5 time] ERROR: "
+        "没有找到包含录制管理逻辑的 JS/CJS bundle；"
+        f"已扫描：{searched}"
     )
 
-manager_path = min(candidates, key=lambda p: len(str(p)))
-text = manager_path.read_text(encoding="utf-8", errors="strict")
+all_candidates.sort(
+    key=lambda item: (
+        item[0],
+        item[1].stat().st_size,
+    ),
+    reverse=True,
+)
+
+best_score, manager_path, text = all_candidates[0]
+
+required_signals = [
+    "checkLiveStatusAndRecord",
+    "ignoreDataLimit",
+]
+
+missing_signals = [
+    signal for signal in required_signals
+    if signal not in text
+]
+
+if missing_signals:
+    details = "; ".join(
+        f"{score}:{path.name}"
+        for score, path, _ in all_candidates[:5]
+    )
+    raise SystemExit(
+        "[fnOS native5 time] ERROR: "
+        "候选 bundle 缺少关键录制特征 "
+        f"{missing_signals}; candidates={details}"
+    )
+
+print(
+    "[fnOS native5 time] target bundle: "
+    f"{manager_path.name} score={best_score} "
+    f"size={manager_path.stat().st_size}",
+    flush=True,
+)
+print(
+    "[fnOS native5 time] target path: "
+    f"{manager_path}",
+    flush=True,
+)
 
 HELPER_MARKER = "// fnOS native3: strict monitor-time helper"
 START_MARKER = "// fnOS native3: strict startRecord guard"
@@ -157,7 +260,7 @@ if HELPER_MARKER not in text:
     if anchor not in text:
         raise SystemExit(
             "[fnOS native3 time] ERROR: "
-            "找不到 const recorders = []，上游结构已变化"
+            "target bundle 已找到，但找不到 const recorders = []；上游 bundle 结构已变化"
         )
 
     helper = block([
@@ -388,7 +491,7 @@ elif BATCH_MARKER not in text:
     if handle_pos < 0 or need_pos < 0 or need_pos <= handle_pos:
         raise SystemExit(
             "[fnOS native3 time] ERROR: "
-            "找不到 handleBatchQuery / needCheckRecorders"
+            "target bundle 已找到，但找不到 handleBatchQuery / needCheckRecorders"
         )
 
     head = text[handle_pos:need_pos]
@@ -449,7 +552,7 @@ if FINAL_MARKER not in text:
     if not m:
         raise SystemExit(
             "[fnOS native3 time] ERROR: "
-            "找不到 recorder.cache / recorders.push 插入点"
+            "target bundle 已找到，但找不到 recorder.cache / recorders.push 插入点"
         )
 
     gate = block([
@@ -541,7 +644,7 @@ if WINDOW_MARKER not in text:
     if not matches:
         raise SystemExit(
             "[fnOS native4 window] ERROR: "
-            "找不到 return manager;，无法注入窗口重新布防"
+            "target bundle 已找到，但找不到 return manager;，无法注入窗口重新布防"
         )
 
     m = matches[-1]
@@ -733,7 +836,7 @@ pre{margin:0;padding:18px 20px;white-space:pre-wrap;word-break:break-all;font:13
 </head>
 <body>
 <header>
-<h2>biliLive-tools fnOS native4 日志</h2>
+<h2>biliLive-tools fnOS native5 日志</h2>
 <nav>${tabs}</nav>
 <small>每 5 秒自动刷新 · 当前 ${selected}.log</small>
 </header>
@@ -805,7 +908,7 @@ server.on("upgrade", (req, clientSocket, head) => {
 
 server.listen(visiblePort, "0.0.0.0", () => {
   console.log(
-    `[fnOS native4 proxy] 0.0.0.0:${visiblePort} -> ` +
+    `[fnOS native5 proxy] 0.0.0.0:${visiblePort} -> ` +
     `127.0.0.1:${targetPort}; logs=/fnos-logs`,
   );
 });
@@ -817,7 +920,7 @@ NODE
 runtime_diagnostics() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native4] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native5] runtime diagnostics"
     echo "TZ=${TZ:-}"
     echo "date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "node=$(node -v 2>/dev/null || echo missing)"
@@ -892,10 +995,10 @@ start_app() {
     return 1
   }
 
-  echo "$(date '+%F %T') applying fnOS native4 strict monitor-time + window re-arm patch" >> "$BACK_LOG"
+  echo "$(date '+%F %T') applying fnOS native5 bundle-aware strict-time + window re-arm patch" >> "$BACK_LOG"
 
   if ! apply_time_patch >> "$BACK_LOG" 2>&1; then
-    echo "biliLive-tools native4 时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
+    echo "biliLive-tools native5 时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
       > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
@@ -965,7 +1068,7 @@ start_app() {
   fi
 
   prepare_fnos_proxy || {
-    echo "native4 日志代理生成失败。" > "${TRIM_TEMP_LOGFILE}"
+    echo "native5 日志代理生成失败。" > "${TRIM_TEMP_LOGFILE}"
     return 1
   }
 
@@ -1002,7 +1105,7 @@ start_app() {
   export FNOS_TARGET_PORT="$INTERNAL_FRONT_PORT"
   export FNOS_LOG_DIR="$LOG_DIR"
 
-  printf '%s starting native4 proxy on %s -> %s\n' \
+  printf '%s starting native5 proxy on %s -> %s\n' \
     "$(date '+%F %T')" \
     "$FRONT_PORT" \
     "$INTERNAL_FRONT_PORT" \
@@ -1023,7 +1126,7 @@ start_app() {
   if ! pid_alive "$FRONT_PID"; then
     stop_one "$WRAPPER_PID"
     stop_one "$BACK_PID"
-    echo "biliLive-tools native4 前端代理启动失败，请查看 proxy.log。" \
+    echo "biliLive-tools native5 前端代理启动失败，请查看 proxy.log。" \
       > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
