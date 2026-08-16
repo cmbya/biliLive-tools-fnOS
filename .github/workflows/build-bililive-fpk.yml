@@ -121,28 +121,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "验证上游 Tag: $VERSION"
-
-          if ! git ls-remote \
-            --exit-code \
-            --tags \
-            --refs \
-            https://github.com/renmu123/biliLive-tools.git \
-            "refs/tags/$VERSION" \
-            >/dev/null 2>&1; then
-
-            if ! git ls-remote \
-              --exit-code \
-              --tags \
-              --refs \
-              https://github.com/renmu123/biliLive-tools.git \
-              "refs/tags/v$VERSION" \
-              >/dev/null 2>&1; then
-
-              echo "❌ 上游不存在 Tag: $VERSION"
-              exit 1
-            fi
-          fi
+          echo "验证 biliLive-tools / bililive-cli: $VERSION"
 
           TMP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TMP_DIR"' EXIT
@@ -163,34 +142,22 @@ jobs:
             --no-fund \
             "bililive-cli@${VERSION}"
 
-          node \
-            node_modules/bililive-cli/lib/index.cjs \
-            --version \
-            || true
+          CLI_ROOT="$TMP_DIR/node_modules/bililive-cli/lib"
+          test -d "$CLI_ROOT"
 
-          python3 - <<'PY'
+          echo ""
+          echo "========== bililive-cli CJS bundle =========="
+          find "$CLI_ROOT" -type f -name '*.cjs' -print
+
+          echo ""
+          echo "========== 验证真实 npm bundle =========="
+
+          python3 - "$CLI_ROOT" <<'PY'
           from pathlib import Path
           import re
+          import sys
 
-          files = list(
-              Path(".").rglob(
-                  "@bililive-tools/manager/lib/manager.js"
-              )
-          )
-
-          if not files:
-              raise SystemExit(
-                  "❌ 找不到 manager.js"
-              )
-
-          path = min(
-              files,
-              key=lambda p: len(str(p)),
-          )
-
-          text = path.read_text(
-              encoding="utf-8",
-          )
+          root = Path(sys.argv[1])
 
           start_pattern = re.compile(
               r"if\s*\(\s*!ignoreDataLimit\s*&&\s*"
@@ -198,68 +165,73 @@ jobs:
               r"\s*\)\s*return\s*;?"
           )
 
-          handle_pos = text.find(
-              "const handleBatchQuery"
-          )
-
-          need_pos = text.find(
-              "const needCheckRecorders"
-          )
-
           batch_pattern = re.compile(
               r'(\.filter\(\s*\(r\)\s*=>\s*'
-              r'r\.providerId\s*===\s*'
-              r'["\']Bilibili["\']\s*\))'
+              r'r\.providerId\s*===\s*["\']Bilibili["\']\s*\))'
           )
 
-          start_count = len(
-              list(
-                  start_pattern.finditer(text)
-              )
-          )
+          files = list(root.rglob("*.cjs"))
+          if not files:
+              raise SystemExit("❌ bililive-cli/lib 中没有 CJS 文件")
 
-          if (
-              handle_pos < 0
-              or need_pos <= handle_pos
-          ):
-              batch_count = 0
-          else:
-              batch_count = len(
-                  list(
-                      batch_pattern.finditer(
-                          text[
-                              handle_pos:
-                              need_pos
-                          ]
-                      )
+          candidates = []
+          for path in files:
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              score = sum(
+                  item in text
+                  for item in (
+                      "ignoreDataLimit",
+                      "isBetweenTimeRange",
+                      "handleBatchQuery",
+                      'providerId === "Bilibili"',
                   )
               )
+              if score >= 2:
+                  candidates.append((score, path, text))
 
-          print(
-              "startRecord pattern:",
-              start_count,
-          )
+          if not candidates:
+              raise SystemExit("❌ 没找到录制管理器所在的 CJS bundle")
 
-          print(
-              "Bilibili batch pattern:",
-              batch_count,
-          )
-
-          if start_count != 1:
-              raise SystemExit(
-                  "❌ 上游 startRecord 结构变化，"
-                  "native2 补丁需要更新"
+          found = None
+          for score, path, text in sorted(
+              candidates,
+              key=lambda item: (-item[0], len(str(item[1]))),
+          ):
+              start_count = len(list(start_pattern.finditer(text)))
+              handle_pos = text.find("const handleBatchQuery")
+              need_pos = text.find(
+                  "const needCheckRecorders",
+                  handle_pos if handle_pos >= 0 else 0,
               )
 
-          if batch_count != 1:
-              raise SystemExit(
-                  "❌ 上游 Bilibili batch 结构变化，"
-                  "native2 补丁需要更新"
+              if handle_pos >= 0 and need_pos > handle_pos:
+                  batch_count = len(
+                      list(
+                          batch_pattern.finditer(
+                              text[handle_pos:need_pos]
+                          )
+                      )
+                  )
+              else:
+                  batch_count = 0
+
+              print(
+                  f"{path.name}: score={score}, "
+                  f"startRecord={start_count}, BilibiliBatch={batch_count}"
               )
 
-          print(
-              "✅ native2 时间补丁兼容性检查通过"
-          )
+              if start_count == 1 and batch_count == 1:
+                  found = path
+                  break
+
+          if found is None:
+              raise SystemExit("❌ npm bundle 结构与 native2 补丁不兼容")
+
+          print("")
+          print("✅ 找到真实录制管理器 bundle：", found)
+          print("✅ startRecord 补丁点：1")
+          print("✅ Bilibili batch 补丁点：1")
+          print("✅ native2 时间补丁兼容性检查通过")
           PY
 
       - name: 构建 x86 FPK
