@@ -120,31 +120,13 @@ import re
 import sys
 
 backend = Path(sys.argv[1]).resolve()
+cli_root = backend / "node_modules" / "bililive-cli" / "lib"
 
-candidates = list(
-    backend.rglob("@bililive-tools/manager/lib/manager.js")
-)
-
-if not candidates:
-    candidates = [
-        p
-        for p in backend.rglob("manager.js")
-        if "@bililive-tools" in str(p)
-        and "manager" in str(p)
-        and "/lib/" in str(p).replace("\\", "/")
-    ]
-
-if not candidates:
+if not cli_root.is_dir():
     raise SystemExit(
         "[fnOS native2 time] ERROR: "
-        "找不到 @bililive-tools/manager/lib/manager.js"
+        f"找不到 bililive-cli/lib: {cli_root}"
     )
-
-manager_path = min(candidates, key=lambda p: len(str(p)))
-text = manager_path.read_text(
-    encoding="utf-8",
-    errors="strict",
-)
 
 START_MARKER = "// fnOS native2: monitor-time guard"
 BATCH_MARKER = "// fnOS native2: Bilibili batch monitor-time guard"
@@ -160,53 +142,114 @@ batch_pattern = re.compile(
     r'r\.providerId\s*===\s*["\']Bilibili["\']\s*\))'
 )
 
+candidates = []
+for path in sorted(cli_root.rglob("*.cjs")):
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    score = sum(
+        item in content
+        for item in (
+            "ignoreDataLimit",
+            "isBetweenTimeRange",
+            "handleBatchQuery",
+            'providerId === "Bilibili"',
+        )
+    )
+    if score >= 2:
+        candidates.append((score, path, content))
+
+if not candidates:
+    print(
+        "[fnOS native2 time] ERROR: "
+        "bililive-cli/lib 中没有找到包含录制管理器逻辑的 CJS bundle",
+        flush=True,
+    )
+    print("[fnOS native2 time] lib files:", flush=True)
+    for path in sorted(cli_root.rglob("*.cjs")):
+        print("  " + str(path.relative_to(cli_root)), flush=True)
+    raise SystemExit(1)
+
+candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+
+target_path = None
+target_text = None
+
+for score, path, content in candidates:
+    has_start = START_MARKER in content or start_pattern.search(content) is not None
+    handle_pos = content.find("const handleBatchQuery")
+    need_pos = content.find(
+        "const needCheckRecorders",
+        handle_pos if handle_pos >= 0 else 0,
+    )
+    has_batch = (
+        BATCH_MARKER in content
+        or (
+            handle_pos >= 0
+            and need_pos > handle_pos
+            and batch_pattern.search(content[handle_pos:need_pos]) is not None
+        )
+    )
+    if has_start and has_batch:
+        target_path = path
+        target_text = content
+        break
+
+if target_path is None or target_text is None:
+    print(
+        "[fnOS native2 time] ERROR: "
+        "找到了 CJS bundle，但没有一个同时包含 startRecord 与 Bilibili batch 两个补丁点",
+        flush=True,
+    )
+    for score, path, _ in candidates:
+        print(f"  score={score}: {path.relative_to(cli_root)}", flush=True)
+    raise SystemExit(1)
+
+text = target_text
 changed = False
+
+print(
+    "[fnOS native2 time] target bundle: "
+    + str(target_path.relative_to(cli_root)),
+    flush=True,
+)
 
 if START_MARKER not in text:
     matches = list(start_pattern.finditer(text))
-
     if len(matches) != 1:
         raise SystemExit(
             "[fnOS native2 time] ERROR: "
-            "startRecord 时间判断结构变化，"
-            f"期望 1 处，实际 {len(matches)} 处。"
+            f"startRecord 时间判断结构变化，期望 1 处，实际 {len(matches)} 处"
         )
 
-    start_replacement = r'''// fnOS native2: monitor-time guard
-            const fnosTimeAllowed = isBetweenTimeRange(recorder.handleTime);
-            const fnosNow = new Date().toLocaleString(
-                "zh-CN",
-                {
-                    timeZone: "Asia/Shanghai",
-                    hour12: false,
-                },
-            );
-            console.log(
-                `[fnOS native2 time] startRecord ` +
-                `id=${id} now=${fnosNow} ` +
-                `handleTime=${JSON.stringify(recorder.handleTime)} ` +
-                `ignoreDataLimit=${ignoreDataLimit} ` +
-                `allowed=${fnosTimeAllowed}`,
-            );
-            if (!ignoreDataLimit && !fnosTimeAllowed) {
-                console.log(
-                    `[fnOS native2 time] BLOCK startRecord outside monitor window id=${id}`,
-                );
-                return;
-            }'''
+    replacement = r'''// fnOS native2: monitor-time guard
+      const fnosTimeAllowed = isBetweenTimeRange(recorder.handleTime);
+      const fnosNow = new Date().toLocaleString(
+        "zh-CN",
+        {
+          timeZone: "Asia/Shanghai",
+          hour12: false,
+        },
+      );
+      console.log(
+        `[fnOS native2 time] startRecord ` +
+        `id=${id} now=${fnosNow} ` +
+        `handleTime=${JSON.stringify(recorder.handleTime)} ` +
+        `ignoreDataLimit=${ignoreDataLimit} ` +
+        `allowed=${fnosTimeAllowed}`,
+      );
+      if (!ignoreDataLimit && !fnosTimeAllowed) {
+        console.log(
+          `[fnOS native2 time] BLOCK startRecord outside monitor window id=${id}`,
+        );
+        return;
+      }'''
 
-    text = start_pattern.sub(
-        start_replacement,
-        text,
-        count=1,
-    )
+    text = start_pattern.sub(replacement, text, count=1)
     changed = True
 
 if BATCH_MARKER not in text:
     handle_pos = text.find("const handleBatchQuery")
-    need_pos = text.find("const needCheckRecorders")
-
-    if handle_pos < 0 or need_pos < 0 or need_pos <= handle_pos:
+    need_pos = text.find("const needCheckRecorders", handle_pos)
+    if handle_pos < 0 or need_pos <= handle_pos:
         raise SystemExit(
             "[fnOS native2 time] ERROR: "
             "找不到 handleBatchQuery / needCheckRecorders"
@@ -214,91 +257,56 @@ if BATCH_MARKER not in text:
 
     head = text[handle_pos:need_pos]
     matches = list(batch_pattern.finditer(head))
-
     if len(matches) != 1:
         raise SystemExit(
             "[fnOS native2 time] ERROR: "
-            "Bilibili 批量查询过滤结构变化，"
-            f"期望 1 处，实际 {len(matches)} 处。"
+            f"Bilibili batch 结构变化，期望 1 处，实际 {len(matches)} 处"
         )
 
-    batch_replacement = r'''\1
-                // fnOS native2: Bilibili batch monitor-time guard
-                .filter((r) => {
-                    const allowed = isBetweenTimeRange(r.handleTime);
-                    if (
-                        !allowed &&
-                        Array.isArray(r.handleTime) &&
-                        r.handleTime.length === 2
-                    ) {
-                        const now = new Date().toLocaleString(
-                            "zh-CN",
-                            {
-                                timeZone: "Asia/Shanghai",
-                                hour12: false,
-                            },
-                        );
-                        console.log(
-                            `[fnOS native2 time] SKIP Bilibili batch ` +
-                            `channel=${r.channelId} now=${now} ` +
-                            `handleTime=${JSON.stringify(r.handleTime)}`,
-                        );
-                    }
-                    return allowed;
-                })'''
+    replacement = r'''\1
+        // fnOS native2: Bilibili batch monitor-time guard
+        .filter((r) => {
+          const allowed = isBetweenTimeRange(r.handleTime);
+          if (
+            !allowed &&
+            Array.isArray(r.handleTime) &&
+            r.handleTime.length === 2
+          ) {
+            const now = new Date().toLocaleString(
+              "zh-CN",
+              {
+                timeZone: "Asia/Shanghai",
+                hour12: false,
+              },
+            );
+            console.log(
+              `[fnOS native2 time] SKIP Bilibili batch ` +
+              `channel=${r.channelId} now=${now} ` +
+              `handleTime=${JSON.stringify(r.handleTime)}`,
+            );
+          }
+          return allowed;
+        })'''
 
-    patched_head = batch_pattern.sub(
-        batch_replacement,
-        head,
-        count=1,
-    )
-
-    text = (
-        text[:handle_pos]
-        + patched_head
-        + text[need_pos:]
-    )
+    patched_head = batch_pattern.sub(replacement, head, count=1)
+    text = text[:handle_pos] + patched_head + text[need_pos:]
     changed = True
 
 if START_MARKER not in text:
-    raise SystemExit(
-        "[fnOS native2 time] ERROR: "
-        "startRecord patch verification failed"
-    )
-
+    raise SystemExit("[fnOS native2 time] ERROR: startRecord guard 未生效")
 if BATCH_MARKER not in text:
-    raise SystemExit(
-        "[fnOS native2 time] ERROR: "
-        "Bilibili batch patch verification failed"
-    )
-
+    raise SystemExit("[fnOS native2 time] ERROR: Bilibili batch guard 未生效")
 if start_pattern.search(text):
-    raise SystemExit(
-        "[fnOS native2 time] ERROR: "
-        "旧的反向 startRecord 判断仍然存在"
-    )
+    raise SystemExit("[fnOS native2 time] ERROR: 旧 startRecord 反向判断仍然存在")
 
 if changed:
-    manager_path.write_text(
-        text,
-        encoding="utf-8",
-    )
-    print(
-        "[fnOS native2 time] patched: "
-        + str(manager_path),
-        flush=True,
-    )
+    target_path.write_text(text, encoding="utf-8")
+    print("[fnOS native2 time] patched bundle: " + str(target_path), flush=True)
 else:
-    print(
-        "[fnOS native2 time] patch already present: "
-        + str(manager_path),
-        flush=True,
-    )
+    print("[fnOS native2 time] patch already present", flush=True)
 
 print(
-    "[fnOS native2 time] "
-    "startRecord guard = OK; "
-    "Bilibili batch guard = OK",
+    "[fnOS native2 time] startRecord guard = OK; Bilibili batch guard = OK",
     flush=True,
 )
 PY

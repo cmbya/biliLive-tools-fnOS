@@ -68,3 +68,18 @@ FPK：biliLive-tools_3.20.0_native2_fnOS_x86.fpk
 - 新上游版本先在 Actions 里安装真实 npm CLI，
   检查两个补丁点仍兼容，再生成 FPK；
 - 最新版本检测不使用未认证 GitHub REST API。
+
+
+## native2 bundlefix
+
+`bililive-cli` 发布到 npm 时，`@bililive-tools/manager` 不会作为独立的
+`node_modules/@bililive-tools/manager/lib/manager.js` 存在。
+CLI 使用 Rollup，录制管理器逻辑会被打进 `node_modules/bililive-cli/lib/*.cjs`。
+
+本修正版：
+
+- Actions 直接检查真实 npm CJS bundle；
+- fnOS 每次启动扫描真实 `lib/**/*.cjs`；
+- 自动定位同时包含 `startRecord` 与 `handleBatchQuery` 的 bundle；
+- 只有两个补丁点都唯一匹配时才修改；
+- 上游结构变化时拒绝盲目修改，并把诊断写进 `backend.log`。
