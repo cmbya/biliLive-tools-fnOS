@@ -96,7 +96,7 @@ path.write_text(
 )
 
 print(
-    "[fnOS native6 log] application logPath=" + log_path,
+    "[fnOS native7 log] application logPath=" + log_path,
     flush=True,
 )
 PY
@@ -186,7 +186,7 @@ for base in search_roots:
 if not all_candidates:
     searched = ", ".join(str(p) for p in search_roots)
     raise SystemExit(
-        "[fnOS native6 time] ERROR: "
+        "[fnOS native7 time] ERROR: "
         "没有找到包含录制管理逻辑的 JS/CJS bundle；"
         f"已扫描：{searched}"
     )
@@ -217,19 +217,19 @@ if missing_signals:
         for score, path, _ in all_candidates[:5]
     )
     raise SystemExit(
-        "[fnOS native6 time] ERROR: "
+        "[fnOS native7 time] ERROR: "
         "候选 bundle 缺少关键录制特征 "
         f"{missing_signals}; candidates={details}"
     )
 
 print(
-    "[fnOS native6 time] target bundle: "
+    "[fnOS native7 time] target bundle: "
     f"{manager_path.name} score={best_score} "
     f"size={manager_path.stat().st_size}",
     flush=True,
 )
 print(
-    "[fnOS native6 time] target path: "
+    "[fnOS native7 time] target path: "
     f"{manager_path}",
     flush=True,
 )
@@ -534,7 +534,7 @@ if RETRY_MARKER not in text:
             '// fnOS native6: immediate-retry time guard\n'
             'if (!fnosIsTimeAllowed(recorder.handleTime)) {\n'
             '    console.log(\n'
-            '        `[fnOS native6 time] BLOCK immediate retry ` +\n'
+            '        `[fnOS native7 time] BLOCK immediate retry ` +\n'
             '        `channel=${recorder.channelId} ` +\n'
             '        `now=${fnosBeijingNowText()} ` +\n'
             '        `handleTime=${JSON.stringify(recorder.handleTime)}`,\n'
@@ -546,10 +546,10 @@ if RETRY_MARKER not in text:
 
         text = retry_re.sub(replacement, text, count=1)
         changed = True
-        print("[fnOS native6 time] immediate-retry guard = patched", flush=True)
+        print("[fnOS native7 time] immediate-retry guard = patched", flush=True)
     else:
         print(
-            "[fnOS native6 time] immediate-retry guard = optional pattern not found; continue",
+            "[fnOS native7 time] immediate-retry guard = optional pattern not found; continue",
             flush=True,
         )
 
@@ -571,17 +571,17 @@ if "ignoreDataLimit = true" in text:
 if changed:
     manager_path.write_text(text, encoding="utf-8")
     print(
-        "[fnOS native6 time] patched: " + str(manager_path),
+        "[fnOS native7 time] patched: " + str(manager_path),
         flush=True,
     )
 else:
     print(
-        "[fnOS native6 time] patch already present",
+        "[fnOS native7 time] patch already present",
         flush=True,
     )
 
-print("[fnOS native6 time] strict Beijing clock = OK", flush=True)
-print("[fnOS native6 time] startRecord guard = OK", flush=True)
+print("[fnOS native7 time] strict Beijing clock = OK", flush=True)
+print("[fnOS native7 time] startRecord guard = OK", flush=True)
 
 check = subprocess.run(
     ["node", "--check", str(manager_path)],
@@ -592,11 +592,11 @@ check = subprocess.run(
 
 if check.returncode != 0:
     raise SystemExit(
-        "[fnOS native6 time] ERROR: patched bundle failed node --check:\n"
+        "[fnOS native7 time] ERROR: patched bundle failed node --check:\n"
         + check.stdout[-4000:]
     )
 
-print("[fnOS native6 time] node --check = OK", flush=True)
+print("[fnOS native7 time] node --check = OK", flush=True)
 PY
 }
 
@@ -611,7 +611,10 @@ const RETRY_MS = 10000;
 const MAX_ATTEMPTS = 3;
 
 const states = new Map();
+const detailLogged = new Set();
+
 let busy = false;
+let lastListCount = null;
 
 function stamp() {
   return new Date().toLocaleString(
@@ -624,7 +627,7 @@ function stamp() {
 }
 
 function log(message) {
-  console.log(`${stamp()} [fnOS native6 window] ${message}`);
+  console.log(`${stamp()} [fnOS native7 window] ${message}`);
 }
 
 function timeToSeconds(value) {
@@ -735,13 +738,21 @@ async function api(pathname, options = {}) {
 function unwrap(value) {
   let current = value;
 
-  for (let i = 0; i < 5; i += 1) {
+  for (let i = 0; i < 8; i += 1) {
     if (
       current == null ||
       typeof current !== "object" ||
       Array.isArray(current)
     ) {
       break;
+    }
+
+    // fnOS native7:
+    // biliLive-tools 3.20.0 REST envelope:
+    // { payload: { data: ... } }
+    if ("payload" in current && current.payload != null) {
+      current = current.payload;
+      continue;
     }
 
     if ("data" in current && current.data != null) {
@@ -815,6 +826,17 @@ async function getDetail(item) {
     typeof item === "object" &&
     Array.isArray(item.handleTime)
   ) {
+    if (!detailLogged.has(item.id)) {
+      detailLogged.add(item.id);
+      log(
+        `DETAIL id=${item.id} from=list ` +
+        `provider=${item.providerId || ""} ` +
+        `channel=${item.channelId || ""} ` +
+        `handleTime=${JSON.stringify(item.handleTime)} ` +
+        `state=${item.state || item.recordStatus || "unknown"}`,
+      );
+    }
+
     return item;
   }
 
@@ -826,7 +848,21 @@ async function getDetail(item) {
       `/recorder/${encodeURIComponent(id)}`,
     );
 
-    return extractRecorder(payload) || item;
+    const recorder = extractRecorder(payload) || item;
+
+    if (!detailLogged.has(id)) {
+      detailLogged.add(id);
+      log(
+        `DETAIL id=${id} from=detail ` +
+        `provider=${recorder?.providerId || item?.providerId || ""} ` +
+        `channel=${recorder?.channelId || item?.channelId || ""} ` +
+        `handleTime=${JSON.stringify(recorder?.handleTime)} ` +
+        `state=${recorder?.state || recorder?.recordStatus || item?.state || "unknown"} ` +
+        `tempStop=${recorder?.tempStopIntervalCheck === true}`,
+      );
+    }
+
+    return recorder;
   } catch (error) {
     log(`DETAIL id=${id} error=${error.message}`);
     return item;
@@ -850,6 +886,11 @@ async function tick() {
         JSON.stringify(payload).slice(0, 500),
       );
       return;
+    }
+
+    if (lastListCount !== items.length) {
+      lastListCount = items.length;
+      log(`LIST count=${items.length}`);
     }
 
     for (const item of items) {
@@ -981,7 +1022,7 @@ NODE
 runtime_diagnostics() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native6] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native7] runtime diagnostics"
     echo "TZ=${TZ:-}"
     echo "date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "node=$(node -v 2>/dev/null || echo missing)"
@@ -1056,10 +1097,10 @@ start_app() {
     return 1
   }
 
-  echo "$(date '+%F %T') applying fnOS native6 stable strict-time patch" >> "$BACK_LOG"
+  echo "$(date '+%F %T') applying fnOS native7 stable strict-time patch" >> "$BACK_LOG"
 
   if ! apply_time_patch >> "$BACK_LOG" 2>&1; then
-    echo "biliLive-tools native6 核心时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
+    echo "biliLive-tools native7 核心时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
       > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
@@ -1137,7 +1178,7 @@ start_app() {
 
   export FNOS_BACKEND_URL="http://127.0.0.1:${BACK_PORT}"
 
-  printf '%s starting native6 time sidecar\n' "$(date '+%F %T')" >> "$TIME_LOG"
+  printf '%s starting native7 time sidecar\n' "$(date '+%F %T')" >> "$TIME_LOG"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid node "$RUNTIME/fnos_time_monitor.js" \
