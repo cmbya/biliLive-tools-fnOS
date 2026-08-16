@@ -3,14 +3,22 @@ set -u
 
 RUNTIME="${TRIM_PKGVAR}/native-runtime"
 FRONT_PID="${TRIM_PKGVAR}/bililivetools.front.pid"
+WRAPPER_PID="${TRIM_PKGVAR}/bililivetools.wrapper.pid"
 BACK_PID="${TRIM_PKGVAR}/bililivetools.back.pid"
 
 FRONT_PORT="${TRIM_SERVICE_PORT:-3000}"
 BACK_PORT="18010"
+
+if [ "$FRONT_PORT" -le 64000 ]; then
+  INTERNAL_FRONT_PORT=$((FRONT_PORT + 1000))
+else
+  INTERNAL_FRONT_PORT=$((FRONT_PORT - 1000))
+fi
 VIDEO_DIR="${TRIM_DATA_SHARE_PATHS%%:*}"
 
 LOG_DIR="${VIDEO_DIR}/biliLive-tools-Logs"
 FRONT_LOG="${LOG_DIR}/webui.log"
+PROXY_LOG="${LOG_DIR}/proxy.log"
 BACK_LOG="${LOG_DIR}/backend.log"
 MAIN_LOG="${LOG_DIR}/main.log"
 
@@ -35,17 +43,19 @@ clean_pid() {
 
 is_running() {
   clean_pid "$BACK_PID"
+  clean_pid "$WRAPPER_PID"
   clean_pid "$FRONT_PID"
-  pid_alive "$BACK_PID" && pid_alive "$FRONT_PID"
+
+  pid_alive "$BACK_PID" \
+    && pid_alive "$WRAPPER_PID" \
+    && pid_alive "$FRONT_PID"
 }
 
 rotate_log() {
   local f="$1"
   [ -f "$f" ] || return 0
-
   local size
   size="$(wc -c < "$f" 2>/dev/null || echo 0)"
-
   if [ "${size:-0}" -ge 10485760 ]; then
     rm -f "${f}.1"
     mv "$f" "${f}.1"
@@ -54,11 +64,10 @@ rotate_log() {
 
 prepare_logs() {
   mkdir -p "$LOG_DIR" || return 1
-
   rotate_log "$BACK_LOG"
   rotate_log "$FRONT_LOG"
+  rotate_log "$PROXY_LOG"
   rotate_log "$MAIN_LOG"
-
   return 0
 }
 
@@ -69,7 +78,6 @@ repair_video_link() {
   if [ -L "$RUNTIME/video" ]; then
     local cur
     cur="$(readlink "$RUNTIME/video" 2>/dev/null || true)"
-
     if [ "$cur" != "$VIDEO_DIR" ]; then
       rm -f "$RUNTIME/video"
       ln -s "$VIDEO_DIR" "$RUNTIME/video"
@@ -88,24 +96,15 @@ import sys
 path = Path(sys.argv[1])
 log_path = sys.argv[2]
 
-cfg = json.loads(
-    path.read_text(encoding="utf-8")
-)
-
+cfg = json.loads(path.read_text(encoding="utf-8"))
 cfg["logPath"] = log_path
-
 path.write_text(
-    json.dumps(
-        cfg,
-        ensure_ascii=False,
-        indent=2,
-    ) + "\n",
+    json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
 
 print(
-    "[fnOS native2 log] "
-    f"application logPath={log_path}",
+    "[fnOS native4 log] application logPath=" + log_path,
     flush=True,
 )
 PY
@@ -120,202 +119,705 @@ import re
 import sys
 
 backend = Path(sys.argv[1]).resolve()
-cli_root = backend / "node_modules" / "bililive-cli" / "lib"
 
-if not cli_root.is_dir():
-    raise SystemExit(
-        "[fnOS native2 time] ERROR: "
-        f"找不到 bililive-cli/lib: {cli_root}"
-    )
-
-START_MARKER = "// fnOS native2: monitor-time guard"
-BATCH_MARKER = "// fnOS native2: Bilibili batch monitor-time guard"
-
-start_pattern = re.compile(
-    r"if\s*\(\s*!ignoreDataLimit\s*&&\s*"
-    r"isBetweenTimeRange\(\s*recorder\.handleTime\s*\)"
-    r"\s*\)\s*return\s*;?"
-)
-
-batch_pattern = re.compile(
-    r'(\.filter\(\s*\(r\)\s*=>\s*'
-    r'r\.providerId\s*===\s*["\']Bilibili["\']\s*\))'
-)
-
-candidates = []
-for path in sorted(cli_root.rglob("*.cjs")):
-    content = path.read_text(encoding="utf-8", errors="ignore")
-    score = sum(
-        item in content
-        for item in (
-            "ignoreDataLimit",
-            "isBetweenTimeRange",
-            "handleBatchQuery",
-            'providerId === "Bilibili"',
-        )
-    )
-    if score >= 2:
-        candidates.append((score, path, content))
+candidates = list(backend.rglob("@bililive-tools/manager/lib/manager.js"))
+if not candidates:
+    candidates = [
+        p for p in backend.rglob("manager.js")
+        if "@bililive-tools" in str(p)
+        and "manager" in str(p)
+        and "/lib/" in str(p).replace("\\", "/")
+    ]
 
 if not candidates:
-    print(
-        "[fnOS native2 time] ERROR: "
-        "bililive-cli/lib 中没有找到包含录制管理器逻辑的 CJS bundle",
-        flush=True,
+    raise SystemExit(
+        "[fnOS native3 time] ERROR: "
+        "找不到 @bililive-tools/manager/lib/manager.js"
     )
-    print("[fnOS native2 time] lib files:", flush=True)
-    for path in sorted(cli_root.rglob("*.cjs")):
-        print("  " + str(path.relative_to(cli_root)), flush=True)
-    raise SystemExit(1)
 
-candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+manager_path = min(candidates, key=lambda p: len(str(p)))
+text = manager_path.read_text(encoding="utf-8", errors="strict")
 
-target_path = None
-target_text = None
+HELPER_MARKER = "// fnOS native3: strict monitor-time helper"
+START_MARKER = "// fnOS native3: strict startRecord guard"
+FINAL_MARKER = "// fnOS native3: final automatic-record gate"
+BATCH_MARKER = "// fnOS native3: strict Bilibili batch gate"
+FORCE_MARKER = "fnosForceOutsideWindow"
 
-for score, path, content in candidates:
-    has_start = START_MARKER in content or start_pattern.search(content) is not None
-    handle_pos = content.find("const handleBatchQuery")
-    need_pos = content.find(
-        "const needCheckRecorders",
-        handle_pos if handle_pos >= 0 else 0,
-    )
-    has_batch = (
-        BATCH_MARKER in content
-        or (
-            handle_pos >= 0
-            and need_pos > handle_pos
-            and batch_pattern.search(content[handle_pos:need_pos]) is not None
-        )
-    )
-    if has_start and has_batch:
-        target_path = path
-        target_text = content
-        break
-
-if target_path is None or target_text is None:
-    print(
-        "[fnOS native2 time] ERROR: "
-        "找到了 CJS bundle，但没有一个同时包含 startRecord 与 Bilibili batch 两个补丁点",
-        flush=True,
-    )
-    for score, path, _ in candidates:
-        print(f"  score={score}: {path.relative_to(cli_root)}", flush=True)
-    raise SystemExit(1)
-
-text = target_text
 changed = False
 
-print(
-    "[fnOS native2 time] target bundle: "
-    + str(target_path.relative_to(cli_root)),
-    flush=True,
-)
+def block(lines):
+    return "\n".join(lines)
 
-if START_MARKER not in text:
-    matches = list(start_pattern.finditer(text))
-    if len(matches) != 1:
+# ------------------------------------------------------------
+# 1) Strict Beijing-time helper.
+# ------------------------------------------------------------
+if HELPER_MARKER not in text:
+    anchor = "const recorders = [];"
+    if anchor not in text:
         raise SystemExit(
-            "[fnOS native2 time] ERROR: "
-            f"startRecord 时间判断结构变化，期望 1 处，实际 {len(matches)} 处"
+            "[fnOS native3 time] ERROR: "
+            "找不到 const recorders = []，上游结构已变化"
         )
 
-    replacement = r'''// fnOS native2: monitor-time guard
-      const fnosTimeAllowed = isBetweenTimeRange(recorder.handleTime);
-      const fnosNow = new Date().toLocaleString(
-        "zh-CN",
-        {
-          timeZone: "Asia/Shanghai",
-          hour12: false,
-        },
-      );
-      console.log(
-        `[fnOS native2 time] startRecord ` +
-        `id=${id} now=${fnosNow} ` +
-        `handleTime=${JSON.stringify(recorder.handleTime)} ` +
-        `ignoreDataLimit=${ignoreDataLimit} ` +
-        `allowed=${fnosTimeAllowed}`,
-      );
-      if (!ignoreDataLimit && !fnosTimeAllowed) {
-        console.log(
-          `[fnOS native2 time] BLOCK startRecord outside monitor window id=${id}`,
-        );
-        return;
-      }'''
+    helper = block([
+        "// fnOS native3: strict monitor-time helper",
+        "    const fnosTimeToSeconds = (value) => {",
+        '        if (typeof value !== "string") return null;',
+        r'        const match = value.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);',
+        "        if (!match) return null;",
+        "",
+        "        const h = Number(match[1]);",
+        "        const m = Number(match[2]);",
+        '        const s = Number(match[3] ?? "0");',
+        "",
+        "        if (",
+        "            !Number.isInteger(h) ||",
+        "            !Number.isInteger(m) ||",
+        "            !Number.isInteger(s) ||",
+        "            h < 0 || h > 23 ||",
+        "            m < 0 || m > 59 ||",
+        "            s < 0 || s > 59",
+        "        ) {",
+        "            return null;",
+        "        }",
+        "",
+        "        return h * 3600 + m * 60 + s;",
+        "    };",
+        "",
+        "    const fnosBeijingNowSeconds = () => {",
+        "        const parts = new Intl.DateTimeFormat(",
+        '            "en-GB",',
+        "            {",
+        '                timeZone: "Asia/Shanghai",',
+        '                hour: "2-digit",',
+        '                minute: "2-digit",',
+        '                second: "2-digit",',
+        '                hourCycle: "h23",',
+        "            },",
+        "        ).formatToParts(new Date());",
+        "",
+        "        const obj = Object.fromEntries(",
+        "            parts.map((item) => [item.type, item.value]),",
+        "        );",
+        "",
+        "        return (",
+        "            Number(obj.hour) * 3600 +",
+        "            Number(obj.minute) * 60 +",
+        "            Number(obj.second)",
+        "        );",
+        "    };",
+        "",
+        "    const fnosBeijingNowText = () => {",
+        "        return new Intl.DateTimeFormat(",
+        '            "zh-CN",',
+        "            {",
+        '                timeZone: "Asia/Shanghai",',
+        '                year: "numeric",',
+        '                month: "2-digit",',
+        '                day: "2-digit",',
+        '                hour: "2-digit",',
+        '                minute: "2-digit",',
+        '                second: "2-digit",',
+        '                hourCycle: "h23",',
+        "            },",
+        "        ).format(new Date());",
+        "    };",
+        "",
+        "    const fnosIsTimeAllowed = (range) => {",
+        "        // No configured time window means all day.",
+        "        " + "if (!Array.isArray(range) || range.length !== 2) {",
+        "            return true;",
+        "        }",
+        "",
+        "        const startRaw = range[0];",
+        "        const endRaw = range[1];",
+        "",
+        "        if (",
+        "            startRaw == null ||",
+        "            endRaw == null ||",
+        '            String(startRaw).trim() === "" ||',
+        '            String(endRaw).trim() === ""',
+        "        ) {",
+        "            return true;",
+        "        }",
+        "",
+        "        const start = fnosTimeToSeconds(String(startRaw));",
+        "        const end = fnosTimeToSeconds(String(endRaw));",
+        "",
+        "        // Configured but malformed -> fail closed.",
+        "        if (start == null || end == null) {",
+        "            console.error(",
+        "                `[fnOS native3 time] INVALID handleTime=` +",
+        "                `${JSON.stringify(range)} => BLOCK`,",
+        "            );",
+        "            return false;",
+        "        }",
+        "",
+        "        // Same start/end = all day.",
+        "        if (start === end) return true;",
+        "",
+        "        const now = fnosBeijingNowSeconds();",
+        "",
+        "        if (start < end) {",
+        "            return now >= start && now <= end;",
+        "        }",
+        "",
+        "        // Cross midnight, e.g. 22:00 -> 02:00.",
+        "        return now >= start || now <= end;",
+        "    };",
+        "",
+    ]) + "\n    "
 
-    text = start_pattern.sub(replacement, text, count=1)
+    text = text.replace(anchor, helper + anchor, 1)
     changed = True
 
-if BATCH_MARKER not in text:
-    handle_pos = text.find("const handleBatchQuery")
-    need_pos = text.find("const needCheckRecorders", handle_pos)
-    if handle_pos < 0 or need_pos <= handle_pos:
+# ------------------------------------------------------------
+# 2) startRecord strict guard and default no-bypass.
+# ------------------------------------------------------------
+native3_start_block = block([
+    "// fnOS native3: strict startRecord guard",
+    "            const fnosTimeAllowed = fnosIsTimeAllowed(recorder.handleTime);",
+    "            console.log(",
+    "                `[fnOS native3 time] startRecord ` +",
+    "                `id=${id} now=${fnosBeijingNowText()} ` +",
+    "                `handleTime=${JSON.stringify(recorder.handleTime)} ` +",
+    "                `ignoreDataLimit=${ignoreDataLimit} ` +",
+    "                `allowed=${fnosTimeAllowed}`,",
+    "            );",
+    "",
+    "            if (!ignoreDataLimit && !fnosTimeAllowed) {",
+    "                console.log(",
+    "                    `[fnOS native3 time] BLOCK startRecord outside monitor window ` +",
+    "                    `id=${id}`,",
+    "                );",
+    "                return;",
+    "            }",
+])
+
+if START_MARKER not in text:
+    native2_marker = "// fnOS native2: monitor-time guard"
+    if native2_marker in text:
+        start = text.index(native2_marker)
+        # End at the next "await recorder.checkLiveStatusAndRecord" to safely
+        # replace only native2's guard block.
+        call_pos = text.find("await recorder.checkLiveStatusAndRecord", start)
+        if call_pos < 0:
+            raise SystemExit(
+                "[fnOS native3 time] ERROR: "
+                "native2 startRecord block found but call anchor missing"
+            )
+        text = text[:start] + native3_start_block + "\n            " + text[call_pos:]
+        changed = True
+    else:
+        original_start_re = re.compile(
+            r"if\s*\(\s*!ignoreDataLimit\s*&&\s*"
+            r"isBetweenTimeRange\(\s*recorder\.handleTime\s*\)"
+            r"\s*\)\s*return\s*;?"
+        )
+        if not original_start_re.search(text):
+            raise SystemExit(
+                "[fnOS native3 time] ERROR: 找不到 startRecord 时间判断"
+            )
+        text = original_start_re.sub(native3_start_block, text, count=1)
+        changed = True
+
+# Change default bypass true -> false.
+default_re = re.compile(
+    r"const\s*\{\s*ignoreDataLimit\s*=\s*true\s*\}\s*=\s*iOpts\s*;"
+)
+if default_re.search(text):
+    text = default_re.sub(
+        "const { ignoreDataLimit = false } = iOpts;",
+        text,
+        count=1,
+    )
+    changed = True
+
+# Mark only explicit force starts so final gate knows the difference.
+if FORCE_MARKER not in text:
+    manual_anchor = "isManualStart: true,"
+    # Prefer occurrence inside startRecord by searching after START_MARKER.
+    start_pos = text.find(START_MARKER)
+    manual_pos = text.find(manual_anchor, start_pos)
+    if manual_pos < 0:
         raise SystemExit(
-            "[fnOS native2 time] ERROR: "
+            "[fnOS native3 time] ERROR: "
+            "找不到 startRecord 的 isManualStart:true"
+        )
+    insert_at = manual_pos + len(manual_anchor)
+    text = (
+        text[:insert_at]
+        + "\n                fnosForceOutsideWindow: ignoreDataLimit === true,"
+        + text[insert_at:]
+    )
+    changed = True
+
+# ------------------------------------------------------------
+# 3) Bilibili batch strict filter.
+# ------------------------------------------------------------
+if "fnOS native2: Bilibili batch monitor-time guard" in text:
+    text = text.replace(
+        "// fnOS native2: Bilibili batch monitor-time guard",
+        BATCH_MARKER,
+        1,
+    )
+    # Limit replacement to the first native2 helper use in the batch block.
+    batch_pos = text.find(BATCH_MARKER)
+    allowed_pos = text.find(
+        "const allowed = isBetweenTimeRange(r.handleTime);",
+        batch_pos,
+    )
+    if allowed_pos >= 0:
+        old = "const allowed = isBetweenTimeRange(r.handleTime);"
+        text = (
+            text[:allowed_pos]
+            + "const allowed = fnosIsTimeAllowed(r.handleTime);"
+            + text[allowed_pos + len(old):]
+        )
+    text = text.replace(
+        "[fnOS native2 time] SKIP Bilibili batch",
+        "[fnOS native3 time] SKIP Bilibili batch",
+        1,
+    )
+    changed = True
+
+elif BATCH_MARKER not in text:
+    handle_pos = text.find("const handleBatchQuery")
+    need_pos = text.find("const needCheckRecorders")
+    if handle_pos < 0 or need_pos < 0 or need_pos <= handle_pos:
+        raise SystemExit(
+            "[fnOS native3 time] ERROR: "
             "找不到 handleBatchQuery / needCheckRecorders"
         )
 
     head = text[handle_pos:need_pos]
+    batch_pattern = re.compile(
+        r'(\.filter\(\s*\(r\)\s*=>\s*'
+        r'r\.providerId\s*===\s*["\']Bilibili["\']\s*\))'
+    )
     matches = list(batch_pattern.finditer(head))
     if len(matches) != 1:
         raise SystemExit(
-            "[fnOS native2 time] ERROR: "
-            f"Bilibili batch 结构变化，期望 1 处，实际 {len(matches)} 处"
+            "[fnOS native3 time] ERROR: "
+            f"Bilibili batch filter count={len(matches)}"
         )
 
-    replacement = r'''\1
-        // fnOS native2: Bilibili batch monitor-time guard
-        .filter((r) => {
-          const allowed = isBetweenTimeRange(r.handleTime);
-          if (
-            !allowed &&
-            Array.isArray(r.handleTime) &&
-            r.handleTime.length === 2
-          ) {
-            const now = new Date().toLocaleString(
-              "zh-CN",
-              {
-                timeZone: "Asia/Shanghai",
-                hour12: false,
-              },
-            );
-            console.log(
-              `[fnOS native2 time] SKIP Bilibili batch ` +
-              `channel=${r.channelId} now=${now} ` +
-              `handleTime=${JSON.stringify(r.handleTime)}`,
-            );
-          }
-          return allowed;
-        })'''
-
-    patched_head = batch_pattern.sub(replacement, head, count=1)
+    batch_replacement = block([
+        r"\1",
+        "                // fnOS native3: strict Bilibili batch gate",
+        "                .filter((r) => {",
+        "                    const allowed = fnosIsTimeAllowed(r.handleTime);",
+        "                    if (!allowed) {",
+        "                        console.log(",
+        "                            `[fnOS native3 time] SKIP Bilibili batch ` +",
+        "                            `channel=${r.channelId} ` +",
+        "                            `now=${fnosBeijingNowText()} ` +",
+        "                            `handleTime=${JSON.stringify(r.handleTime)}`,",
+        "                        );",
+        "                    }",
+        "                    return allowed;",
+        "                })",
+    ])
+    patched_head = batch_pattern.sub(batch_replacement, head, count=1)
     text = text[:handle_pos] + patched_head + text[need_pos:]
     changed = True
 
-if START_MARKER not in text:
-    raise SystemExit("[fnOS native2 time] ERROR: startRecord guard 未生效")
-if BATCH_MARKER not in text:
-    raise SystemExit("[fnOS native2 time] ERROR: Bilibili batch guard 未生效")
-if start_pattern.search(text):
-    raise SystemExit("[fnOS native2 time] ERROR: 旧 startRecord 反向判断仍然存在")
+# ------------------------------------------------------------
+# 4) Normal auto-check strict filter.
+# ------------------------------------------------------------
+normal_old = ".filter((r) => isBetweenTimeRange(r.handleTime))"
+if normal_old in text:
+    text = text.replace(
+        normal_old,
+        ".filter((r) => fnosIsTimeAllowed(r.handleTime))",
+        1,
+    )
+    changed = True
+
+# ------------------------------------------------------------
+# 5) FINAL gate around every recorder.checkLiveStatusAndRecord.
+#    This is the important "last door": any automatic path that got
+#    through earlier checks still gets blocked here.
+# ------------------------------------------------------------
+if FINAL_MARKER not in text:
+    cache_re = re.compile(
+        r"(recorder\.cache\s*=\s*[^;]+;\s*)"
+        r"((?:this\.)?recorders\.push\(recorder\);)"
+    )
+    m = cache_re.search(text)
+    if not m:
+        raise SystemExit(
+            "[fnOS native3 time] ERROR: "
+            "找不到 recorder.cache / recorders.push 插入点"
+        )
+
+    gate = block([
+        "",
+        "            // fnOS native3: final automatic-record gate",
+        "            const fnosOriginalCheckLiveStatusAndRecord =",
+        "                recorder.checkLiveStatusAndRecord.bind(recorder);",
+        "",
+        "            recorder.checkLiveStatusAndRecord = async (fnosOpts = {}) => {",
+        "                const fnosAllowed = fnosIsTimeAllowed(recorder.handleTime);",
+        "                const fnosForce =",
+        "                    fnosOpts?.fnosForceOutsideWindow === true;",
+        "",
+        "                console.log(",
+        "                    `[fnOS native3 time] FINAL gate ` +",
+        "                    `provider=${recorder.providerId} ` +",
+        "                    `channel=${recorder.channelId} ` +",
+        "                    `now=${fnosBeijingNowText()} ` +",
+        "                    `handleTime=${JSON.stringify(recorder.handleTime)} ` +",
+        "                    `force=${fnosForce} allowed=${fnosAllowed}`,",
+        "                );",
+        "",
+        "                if (!fnosForce && !fnosAllowed) {",
+        "                    console.log(",
+        "                        `[fnOS native3 time] BLOCK automatic record ` +",
+        "                        `provider=${recorder.providerId} ` +",
+        "                        `channel=${recorder.channelId}`,",
+        "                    );",
+        "                    return null;",
+        "                }",
+        "",
+        "                return await fnosOriginalCheckLiveStatusAndRecord(fnosOpts);",
+        "            };",
+        "",
+        "            ",
+    ])
+
+    text = cache_re.sub(
+        lambda mm: mm.group(1) + gate + mm.group(2),
+        text,
+        count=1,
+    )
+    changed = True
+
+# ------------------------------------------------------------
+# Verification
+# ------------------------------------------------------------
+for marker in [HELPER_MARKER, START_MARKER, FINAL_MARKER]:
+    if marker not in text:
+        raise SystemExit(
+            f"[fnOS native3 time] ERROR: missing marker {marker}"
+        )
+
+if "ignoreDataLimit = true" in text:
+    raise SystemExit(
+        "[fnOS native3 time] ERROR: "
+        "ignoreDataLimit default true still exists"
+    )
 
 if changed:
-    target_path.write_text(text, encoding="utf-8")
-    print("[fnOS native2 time] patched bundle: " + str(target_path), flush=True)
+    manager_path.write_text(text, encoding="utf-8")
+    print(
+        "[fnOS native3 time] patched: " + str(manager_path),
+        flush=True,
+    )
 else:
-    print("[fnOS native2 time] patch already present", flush=True)
+    print(
+        "[fnOS native3 time] patch already present",
+        flush=True,
+    )
 
-print(
-    "[fnOS native2 time] startRecord guard = OK; Bilibili batch guard = OK",
-    flush=True,
-)
+print("[fnOS native3 time] strict Beijing clock = OK", flush=True)
+print("[fnOS native3 time] startRecord guard = OK", flush=True)
+print("[fnOS native3 time] final automatic-record gate = OK", flush=True)
+
+# ------------------------------------------------------------
+# native4: monitor-window enter re-arm
+# ------------------------------------------------------------
+WINDOW_MARKER = "// fnOS native4: monitor-window enter re-arm"
+
+if WINDOW_MARKER not in text:
+    matches = list(
+        re.finditer(
+            r"(^|\n)([ \t]*)return\s+manager\s*;",
+            text,
+        )
+    )
+
+    if not matches:
+        raise SystemExit(
+            "[fnOS native4 window] ERROR: "
+            "找不到 return manager;，无法注入窗口重新布防"
+        )
+
+    m = matches[-1]
+    indent = m.group(2)
+
+    lines = [
+        f"{indent}// fnOS native4: monitor-window enter re-arm",
+        f"{indent}const fnosWindowStates = new Map();",
+        "",
+        f"{indent}const fnosWindowTick = async () => {{",
+        f"{indent}    for (const recorder of recorders) {{",
+        f"{indent}        try {{",
+        f"{indent}            const id = recorder.id;",
+        f"{indent}            if (id == null) continue;",
+        "",
+        f"{indent}            const allowed = fnosIsTimeAllowed(recorder.handleTime);",
+        f"{indent}            let state = fnosWindowStates.get(id);",
+        "",
+        f"{indent}            if (!state) {{",
+        f"{indent}                state = {{ inside: false, attempts: 0, lastAttempt: 0 }};",
+        f"{indent}                fnosWindowStates.set(id, state);",
+        f"{indent}            }}",
+        "",
+        f"{indent}            if (!allowed) {{",
+        f"{indent}                if (state.inside) {{",
+        f"{indent}                    console.log(",
+        f"{indent}                        `[fnOS native4 window] EXIT ` +",
+        f"{indent}                        `id=${{id}} provider=${{recorder.providerId}} ` +",
+        f"{indent}                        `channel=${{recorder.channelId}} ` +",
+        f"{indent}                        `now=${{fnosBeijingNowText()}} ` +",
+        f"{indent}                        `handleTime=${{JSON.stringify(recorder.handleTime)}}`,",
+        f"{indent}                    );",
+        f"{indent}                }}",
+        f"{indent}                state.inside = false;",
+        f"{indent}                state.attempts = 0;",
+        f"{indent}                state.lastAttempt = 0;",
+        f"{indent}                continue;",
+        f"{indent}            }}",
+        "",
+        f"{indent}            if (!state.inside) {{",
+        f"{indent}                state.inside = true;",
+        f"{indent}                state.attempts = 0;",
+        f"{indent}                state.lastAttempt = 0;",
+        f"{indent}                console.log(",
+        f"{indent}                    `[fnOS native4 window] ENTER ` +",
+        f"{indent}                    `id=${{id}} provider=${{recorder.providerId}} ` +",
+        f"{indent}                    `channel=${{recorder.channelId}} ` +",
+        f"{indent}                    `now=${{fnosBeijingNowText()}} ` +",
+        f"{indent}                    `handleTime=${{JSON.stringify(recorder.handleTime)}}`,",
+        f"{indent}                );",
+        f"{indent}            }}",
+        "",
+        f"{indent}            if (recorder.disableAutoCheck === true) continue;",
+        "",
+        f"{indent}            if (recorder.recordHandle != null) {{",
+        f"{indent}                state.attempts = 3;",
+        f"{indent}                continue;",
+        f"{indent}            }}",
+        "",
+        f"{indent}            const nowMs = Date.now();",
+        f"{indent}            if (state.attempts < 3 && nowMs - state.lastAttempt >= 10000) {{",
+        f"{indent}                state.attempts += 1;",
+        f"{indent}                state.lastAttempt = nowMs;",
+        f"{indent}                console.log(",
+        f"{indent}                    `[fnOS native4 window] AUTO-START ` +",
+        f"{indent}                    `attempt=${{state.attempts}}/3 id=${{id}} ` +",
+        f"{indent}                    `provider=${{recorder.providerId}} channel=${{recorder.channelId}}`,",
+        f"{indent}                );",
+        f"{indent}                try {{",
+        f"{indent}                    await manager.startRecord(",
+        f"{indent}                        id,",
+        f"{indent}                        {{ ignoreDataLimit: false, fnosTimeWindowStart: true }},",
+        f"{indent}                    );",
+        f"{indent}                }} catch (error) {{",
+        f"{indent}                    console.error(",
+        f"{indent}                        `[fnOS native4 window] AUTO-START error id=${{id}}:`,",
+        f"{indent}                        error,",
+        f"{indent}                    );",
+        f"{indent}                }}",
+        f"{indent}            }}",
+        f"{indent}        }} catch (error) {{",
+        f"{indent}            console.error('[fnOS native4 window] tick error:', error);",
+        f"{indent}        }}",
+        f"{indent}    }}",
+        f"{indent}}};",
+        "",
+        f"{indent}setInterval(() => {{ void fnosWindowTick(); }}, 5000);",
+        f"{indent}setTimeout(() => {{ void fnosWindowTick(); }}, 1500);",
+        "",
+    ]
+
+    scheduler = "\n".join(lines)
+    text = text[:m.start()] + "\n" + scheduler + text[m.start():]
+    changed = True
+
+if WINDOW_MARKER not in text:
+    raise SystemExit("[fnOS native4 window] ERROR: 注入验证失败")
+
+if changed:
+    manager_path.write_text(text, encoding="utf-8")
+
+print("[fnOS native4 window] monitor-window re-arm = OK", flush=True)
 PY
+}
+
+prepare_fnos_proxy() {
+  cat > "$RUNTIME/fnos_front_proxy.js" <<'NODE'
+"use strict";
+
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+
+const visiblePort = Number(process.env.FNOS_VISIBLE_PORT || "3000");
+const targetPort = Number(process.env.FNOS_TARGET_PORT || "4000");
+const logDir = process.env.FNOS_LOG_DIR || process.cwd();
+
+const files = {
+  backend: path.join(logDir, "backend.log"),
+  main: path.join(logDir, "main.log"),
+  webui: path.join(logDir, "webui.log"),
+  proxy: path.join(logDir, "proxy.log"),
+};
+
+function esc(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function tailFile(filePath, maxLines = 800, maxBytes = 1024 * 1024) {
+  try {
+    const stat = fs.statSync(filePath);
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(filePath, "r");
+    const buf = Buffer.alloc(stat.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    fs.closeSync(fd);
+
+    return buf.toString("utf8")
+      .split(/\r?\n/)
+      .slice(-maxLines)
+      .join("\n");
+  } catch (error) {
+    return `日志暂不可用：${error.message}`;
+  }
+}
+
+function send(res, status, type, body) {
+  res.writeHead(status, {
+    "Content-Type": type,
+    "Cache-Control": "no-store",
+  });
+  res.end(body);
+}
+
+function logsPage(req, res) {
+  const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const wanted = u.searchParams.get("file");
+  const selected = Object.prototype.hasOwnProperty.call(files, wanted)
+    ? wanted
+    : "backend";
+
+  const tabs = Object.keys(files).map((name) => {
+    const active = name === selected ? "active" : "";
+    return `<a class="${active}" href="/fnos-logs?file=${name}">${name}.log</a>`;
+  }).join("");
+
+  const content = esc(tailFile(files[selected]));
+
+  const html = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>biliLive-tools fnOS 日志</title>
+<style>
+body{margin:0;background:#101216;color:#e5e7eb;font-family:system-ui,-apple-system,sans-serif}
+header{position:sticky;top:0;background:#191c23;padding:16px 20px;border-bottom:1px solid #303642}
+h2{margin:0 0 12px;font-size:18px}
+nav{display:flex;gap:8px;flex-wrap:wrap}
+nav a{color:#d1d5db;text-decoration:none;padding:7px 11px;border:1px solid #414856;border-radius:8px}
+nav a.active{color:white;background:#2563eb;border-color:#2563eb}
+small{display:block;color:#9ca3af;margin-top:10px}
+pre{margin:0;padding:18px 20px;white-space:pre-wrap;word-break:break-all;font:13px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace}
+</style>
+</head>
+<body>
+<header>
+<h2>biliLive-tools fnOS native4 日志</h2>
+<nav>${tabs}</nav>
+<small>每 5 秒自动刷新 · 当前 ${selected}.log</small>
+</header>
+<pre>${content}</pre>
+</body>
+</html>`;
+
+  send(res, 200, "text/html; charset=utf-8", html);
+}
+
+function proxyHttp(req, res) {
+  const p = http.request({
+    hostname: "127.0.0.1",
+    port: targetPort,
+    path: req.url,
+    method: req.method,
+    headers: req.headers,
+  }, (pr) => {
+    res.writeHead(pr.statusCode || 502, pr.headers);
+    pr.pipe(res);
+  });
+
+  p.on("error", (error) => {
+    send(res, 502, "text/plain; charset=utf-8", `fnOS proxy error: ${error.message}`);
+  });
+
+  req.pipe(p);
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/fnos-logs" || req.url.startsWith("/fnos-logs?")) {
+    logsPage(req, res);
+    return;
+  }
+
+  proxyHttp(req, res);
+});
+
+server.on("upgrade", (req, clientSocket, head) => {
+  const p = http.request({
+    hostname: "127.0.0.1",
+    port: targetPort,
+    path: req.url,
+    method: req.method,
+    headers: req.headers,
+  });
+
+  p.on("upgrade", (pr, proxySocket, proxyHead) => {
+    const headers = [
+      "HTTP/1.1 101 Switching Protocols",
+      ...Object.entries(pr.headers).map(([k, v]) => `${k}: ${v}`),
+      "",
+      "",
+    ];
+
+    clientSocket.write(headers.join("\r\n"));
+
+    if (head && head.length) proxySocket.write(head);
+    if (proxyHead && proxyHead.length) clientSocket.write(proxyHead);
+
+    proxySocket.pipe(clientSocket);
+    clientSocket.pipe(proxySocket);
+  });
+
+  p.on("error", () => clientSocket.destroy());
+  p.on("response", () => clientSocket.destroy());
+  p.end();
+});
+
+server.listen(visiblePort, "0.0.0.0", () => {
+  console.log(
+    `[fnOS native4 proxy] 0.0.0.0:${visiblePort} -> ` +
+    `127.0.0.1:${targetPort}; logs=/fnos-logs`,
+  );
+});
+NODE
+
+  node --check "$RUNTIME/fnos_front_proxy.js"
 }
 
 runtime_diagnostics() {
   {
     echo "============================================================"
-    echo "$(date '+%F %T') [fnOS native2] runtime diagnostics"
+    echo "$(date '+%F %T') [fnOS native4] runtime diagnostics"
     echo "TZ=${TZ:-}"
     echo "date=$(date '+%F %T %z %Z' 2>/dev/null || date)"
     echo "node=$(node -v 2>/dev/null || echo missing)"
@@ -357,6 +859,7 @@ start_app() {
   fi
 
   stop_one "$FRONT_PID"
+  stop_one "$WRAPPER_PID"
   stop_one "$BACK_PID"
 
   repair_video_link || {
@@ -389,10 +892,10 @@ start_app() {
     return 1
   }
 
-  echo "$(date '+%F %T') applying fnOS native2 monitor-time patch" >> "$BACK_LOG"
+  echo "$(date '+%F %T') applying fnOS native4 strict monitor-time + window re-arm patch" >> "$BACK_LOG"
 
   if ! apply_time_patch >> "$BACK_LOG" 2>&1; then
-    echo "biliLive-tools native2 时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
+    echo "biliLive-tools native4 时间段补丁失败，请在录像目录/biliLive-tools-Logs/backend.log 查看。" \
       > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
@@ -461,12 +964,20 @@ start_app() {
     return 1
   fi
 
-  export FRONTEND_PORT="$FRONT_PORT"
+  prepare_fnos_proxy || {
+    echo "native4 日志代理生成失败。" > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  }
+
+  export FRONTEND_PORT="$INTERNAL_FRONT_PORT"
   export BACKEND_PORT="$BACK_PORT"
   export BACKEND_HOST=127.0.0.1
   export WEB_ROOT="$RUNTIME/webui"
 
-  printf '%s starting web wrapper\n' "$(date '+%F %T')" >> "$FRONT_LOG"
+  printf '%s starting internal web wrapper on %s\n' \
+    "$(date '+%F %T')" \
+    "$INTERNAL_FRONT_PORT" \
+    >> "$FRONT_LOG"
 
   if command -v setsid >/dev/null 2>&1; then
     setsid node "$RUNTIME/web_server.js" \
@@ -476,13 +987,43 @@ start_app() {
       >> "$FRONT_LOG" 2>&1 &
   fi
 
+  echo $! > "$WRAPPER_PID"
+
+  sleep 2
+
+  if ! pid_alive "$WRAPPER_PID"; then
+    stop_one "$BACK_PID"
+    echo "biliLive-tools 内部 WebUI 启动失败，请查看 webui.log。" \
+      > "${TRIM_TEMP_LOGFILE}"
+    return 1
+  fi
+
+  export FNOS_VISIBLE_PORT="$FRONT_PORT"
+  export FNOS_TARGET_PORT="$INTERNAL_FRONT_PORT"
+  export FNOS_LOG_DIR="$LOG_DIR"
+
+  printf '%s starting native4 proxy on %s -> %s\n' \
+    "$(date '+%F %T')" \
+    "$FRONT_PORT" \
+    "$INTERNAL_FRONT_PORT" \
+    >> "$PROXY_LOG"
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid node "$RUNTIME/fnos_front_proxy.js" \
+      >> "$PROXY_LOG" 2>&1 &
+  else
+    node "$RUNTIME/fnos_front_proxy.js" \
+      >> "$PROXY_LOG" 2>&1 &
+  fi
+
   echo $! > "$FRONT_PID"
 
   sleep 2
 
   if ! pid_alive "$FRONT_PID"; then
+    stop_one "$WRAPPER_PID"
     stop_one "$BACK_PID"
-    echo "biliLive-tools WebUI 启动失败，请在录像目录/biliLive-tools-Logs/webui.log 查看。" \
+    echo "biliLive-tools native4 前端代理启动失败，请查看 proxy.log。" \
       > "${TRIM_TEMP_LOGFILE}"
     return 1
   fi
@@ -492,6 +1033,7 @@ start_app() {
 
 stop_app() {
   stop_one "$FRONT_PID"
+  stop_one "$WRAPPER_PID"
   stop_one "$BACK_PID"
   return 0
 }
