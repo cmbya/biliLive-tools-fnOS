@@ -12,40 +12,15 @@ TAG="${RAW_TAG#v}"
 VERSION="$TAG"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACK_REV="$(tr -d '[:space:]' < "$ROOT/PACK_REV")"
-
-[[ -n "$PACK_REV" ]] || {
-  echo "PACK_REV 为空" >&2
-  exit 2
-}
-
-if [[ ! "$VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "上游版本必须是 X.Y.Z，当前：$VERSION" >&2
   exit 2
 fi
 
-UP_MAJOR="${BASH_REMATCH[1]}"
-UP_MINOR="${BASH_REMATCH[2]}"
-UP_PATCH="${BASH_REMATCH[3]}"
-
-if [[ ! "$PACK_REV" =~ ^native([0-9]+)$ ]]; then
-  echo "PACK_REV 必须是 native数字，例如 native2；当前：$PACK_REV" >&2
-  exit 2
-fi
-
-PACK_SEQ="${BASH_REMATCH[1]}"
-
-if (( 10#$PACK_SEQ >= 100 )); then
-  echo "native 序号必须小于 100" >&2
-  exit 2
-fi
-
-FNOS_PATCH=$((10#$UP_PATCH * 100 + 10#$PACK_SEQ))
-FNOS_VERSION="${UP_MAJOR}.${UP_MINOR}.${FNOS_PATCH}"
+FNOS_VERSION="$VERSION"
 
 echo "======================================"
 echo "biliLive-tools 上游 : $VERSION"
-echo "fnOS 封装修订       : $PACK_REV"
 echo "fnOS manifest版本   : $FNOS_VERSION"
 echo "======================================"
 
@@ -93,13 +68,12 @@ PY
 python3 \
   - "$PKG/manifest" \
   "$FNOS_VERSION" \
-  "$VERSION" \
-  "$PACK_REV" <<'PY'
+  "$VERSION" <<'PY'
 from pathlib import Path
 import sys
 
 p = Path(sys.argv[1])
-fnos_version, upstream_version, pack_rev = sys.argv[2:]
+fnos_version, upstream_version = sys.argv[2:]
 
 lines = p.read_text(
     encoding="utf-8"
@@ -114,7 +88,7 @@ replace = {
     ),
     "changelog": (
         f"自动跟随上游 biliLive-tools {upstream_version}；"
-        f"fnOS 原生 x86 封装 {pack_rev}；"
+        "fnOS 原生 x86 封装；"
         "修复 startRecord 反向时间判断与 Bilibili 批量查询绕过监控时间段；"
         "日志写入录像目录/biliLive-tools-Logs。"
     ),
@@ -223,7 +197,7 @@ if [[ ! "$MANIFEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 
-OUT="$DIST/biliLive-tools_${VERSION}_${PACK_REV}_fnOS_x86.fpk"
+OUT="$DIST/biliLive-tools_${VERSION}_fnOS_x86.fpk"
 
 tar -czf "$OUT" -C "$PKG" .
 
@@ -268,6 +242,5 @@ echo
 echo "======================================"
 echo "构建成功: $OUT"
 echo "上游版本: $VERSION"
-echo "封装修订: $PACK_REV"
 echo "fnOS安装版本: $FNOS_VERSION"
 echo "======================================"
