@@ -2,27 +2,21 @@
 
 这是 `renmu123/biliLive-tools` 的非官方 fnOS x86 原生自动构建仓库。
 
-- 每天检查一次上游 GitHub 正式 Release
-- 发现新版本后自动生成 `.fpk`
-- 自动发布为 GitHub Pre-release
-- 可在 Actions 页面手动指定版本构建
-- `PACK_REV` 是 fnOS 封装版本，当前为 `native1`
+- 每天检查一次上游 GitHub 正式 Release，发现新版本后构建 FPK。
+- FPK 的 manifest 版本直接使用上游版本，例如 `3.22.1`。
+- FPK 文件名为 `biliLive-tools_3.22.1_fnOS_x86.fpk`，Release tag 为 `fnos-3.22.1`。
+- 自动构建的 FPK 仍以 GitHub Pre-release 发布，因为构建检查不能代替实际安装测试。
+
+同一个上游版本只发布一次。封装代码有改动时，需要等待下一上游版本或另行决定新的版本策略，不能静默替换同版本的 FPK。
+
+## 旧版迁移
+
+旧 FPK 曾把上游补丁号和 `native` 修订号合成 manifest 版本。例如上游 `3.22.1` 的旧包版本是 `3.22.108`。改为直接使用 `3.22.1` 后，旧包在版本比较中会显得更高；FnDepot 无法把当前 `3.22.1` 自动识别为这些旧包的升级。已有安装需要单独迁移；不要依赖索引降版本来覆盖旧包。
 
 ## 自动检查时间
 
 每天北京时间约 08:37 检查一次。
 
-## 版本规则
-
-例如：
-
-- 上游：`3.19.0`
-- fnOS 封装：`native1`
-- FPK：`biliLive-tools_3.19.0_native1_fnOS_x86.fpk`
-- Release tag：`fnos-3.19.0-native1`
-
-如果以后只修改 fnOS 封装，不改上游版本，把 `PACK_REV` 从 `native1` 改成 `native2`，再手动运行 Actions 即可。
-
 ## 重要提示
 
-自动构建只能验证 FPK 结构、上游 Release 标签和对应 `bililive-cli` npm 版本是否存在。上游如果改变 CLI 参数、WebUI API、依赖或配置结构，仍可能需要更新 fnOS 封装，因此自动发布默认使用 Pre-release。
+自动构建验证 FPK 结构、上游 Release 标签及对应 `bililive-cli` npm 版本。上游若改变 CLI 参数、WebUI API、依赖或配置结构，仍需检查 fnOS 封装。
